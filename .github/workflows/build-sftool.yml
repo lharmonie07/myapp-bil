@@ -1,0 +1,232 @@
+name: Build SFTool APK (private source, public runner)
+
+# Запускать вручную из публичного sftool-builder.
+# Исходники и mapping.txt остаются в приватном lharmonie07/sftool.
+# APK + latest.json публикуются в lharmonie07/bro-idk-just-leave-me-alone.
+# Не добавлять pull_request-триггеры: код workflow публичный, а токены дают доступ к приватным репозиториям.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Checkout private SFTool source
+        uses: actions/checkout@v4
+        with:
+          repository: lharmonie07/sftool
+          ref: main
+          path: source
+          fetch-depth: 0
+          token: ${{ secrets.SFTOOL_PRIVATE_TOKEN }}
+
+      # ZIP-обновления, загруженные в корень приватного sftool, применяются
+      # только при нажатии Run workflow. Архив должен содержать файлы проекта
+      # прямо в корне архива, без дополнительной папки sftool-main/.
+      - name: Apply ZIP update archives from private source
+        id: apply_archives
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=( *.zip )
+
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "ZIP-архивов для применения нет."
+            echo "archive_applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for archive in "${archives[@]}"; do
+            echo "Применяю архив обновления: $archive"
+            unzip -o "$archive" -d . >/dev/null
+            rm -f "$archive"
+          done
+
+          git config user.name "SFTool CI"
+          git config user.email "ci@sftool.local"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "После применения архивов изменений нет."
+            echo "archive_applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          COMMIT_SUBJECT="Apply update archive"
+          if [ -f CHANGELOG_PENDING.txt ]; then
+            FIRST_LINE=$(head -n1 CHANGELOG_PENDING.txt | tr -d '\r')
+            if [ -n "$FIRST_LINE" ]; then COMMIT_SUBJECT="$FIRST_LINE"; fi
+            rm -f CHANGELOG_PENDING.txt
+            git add -A
+          fi
+
+          git commit -m "$COMMIT_SUBJECT" -m "[skip ci]"
+          git push origin HEAD:main
+          echo "archive_applied=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            source/**/*.gradle*
+            source/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Cache Android NDK and CMake
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/ndk/26.1.10909125
+            /usr/local/lib/android/sdk/cmake/3.22.1
+          key: sftool-android-ndk-26.1.10909125-cmake-3.22.1
+
+      - name: Locate or install Android command-line tools
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          if [ ! -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK_ROOT/cmdline-tools"
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+          fi
+
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Install Android SDK platform, NDK and CMake
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null || true
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platforms;android-34" \
+            "ndk;26.1.10909125" \
+            "cmake;3.22.1"
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Build release APK (keep detailed output private)
+        id: gradle_build
+        continue-on-error: true
+        run: |
+          set +e
+          ./gradlew assembleRelease --stacktrace > build.log 2>&1
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 0 ]; then
+            echo "APK успешно собран. Полный лог сохранится в приватном репозитории."
+          else
+            echo "::error::Сборка SFTool завершилась ошибкой (код $status). Подробности будут сохранены в приватном репозитории."
+          fi
+          exit 0
+
+      - name: Save complete Gradle log in private repository
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SFTOOL_PRIVATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ ! -s build.log ]; then
+            echo "Полный лог Gradle не создан; пропускаю сохранение."
+            exit 0
+          fi
+
+          LOG_TAG="build-log-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          LOG_FILE="sftool-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}.log"
+          gh release create "$LOG_TAG" build.log \
+            --repo lharmonie07/sftool \
+            --title "SFTool build log ${GITHUB_RUN_NUMBER}" \
+            --prerelease \
+            --notes "Полный лог сборки. Workflow run: ${GITHUB_RUN_ID}; attempt: ${GITHUB_RUN_ATTEMPT}."
+
+      - name: Stop if Gradle build failed
+        if: steps.gradle_build.outputs.exit_code != '0'
+        run: |
+          echo "Сборка неуспешна. Полный лог сохранён в приватном lharmonie07/sftool."
+          exit 1
+
+      - name: Prepare APK and private R8 mapping
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION_CODE=$(git rev-list --count HEAD)
+          VERSION_NAME=$(sed -n 's/^val sftoolVersionName = "\(.*\)"$/\1/p' app/build.gradle.kts)
+          [ -n "$VERSION_NAME" ] || { echo "Не удалось определить sftoolVersionName"; exit 1; }
+          APK_PATH=$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' -print -quit)
+          MAPPING_PATH="app/build/outputs/mapping/release/mapping.txt"
+          [ -n "$APK_PATH" ] && [ -s "$APK_PATH" ]
+          [ -s "$MAPPING_PATH" ]
+
+          mkdir -p publish
+          cp "$APK_PATH" publish/SFTool.apk
+          cp "$MAPPING_PATH" "publish/mapping-v${VERSION_NAME}.txt"
+          SHA256=$(sha256sum publish/SFTool.apk | cut -d' ' -f1)
+          SIZE=$(stat -c %s publish/SFTool.apk)
+          printf '{"versionCode":%s,"versionName":"%s","sha256":"%s","size":%s}\n' \
+            "$VERSION_CODE" "$VERSION_NAME" "$SHA256" "$SIZE" > publish/latest.json
+
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Save APK and mapping in private internal release
+        env:
+          GH_TOKEN: ${{ secrets.SFTOOL_PRIVATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION_CODE='${{ steps.package.outputs.version_code }}'
+          VERSION_NAME='${{ steps.package.outputs.version_name }}'
+          TAG="internal-${VERSION_CODE}"
+          APK_NAME="SFTool-v${VERSION_NAME}.apk"
+          MAPPING_NAME="mapping-v${VERSION_NAME}.txt"
+          cp publish/SFTool.apk "$APK_NAME"
+          cp "publish/mapping-v${VERSION_NAME}.txt" "$MAPPING_NAME"
+
+          if gh release view "$TAG" --repo lharmonie07/sftool >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_NAME" "$MAPPING_NAME" \
+              --repo lharmonie07/sftool --clobber
+          else
+            gh release create "$TAG" "$APK_NAME" "$MAPPING_NAME" \
+              --repo lharmonie07/sftool \
+              --title "SFTool internal ${VERSION_CODE}" \
+              --prerelease \
+              --notes "Служебная приватная сборка и mapping.txt для диагностики."
+          fi
+
+      - name: Publish APK update to public releases repository
+        env:
+          GH_TOKEN: ${{ secrets.SFTOOL_PUBLIC_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          PUBLIC_REPO="lharmonie07/bro-idk-just-leave-me-alone"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Не задан секрет SFTOOL_PUBLIC_RELEASE_TOKEN."
+            exit 1
+          fi
+
+          # Приложение читает latest.json и SFTool.apk из публичного релиза latest.
+          # Сначала загружается APK, затем JSON, чтобы клиент не увидел новую версию раньше APK.
+          if ! gh release view latest --repo "$PUBLIC_REPO" >/dev/null 2>&1; then
+            gh release create latest \
+              --repo "$PUBLIC_REPO" \
+              --title "SFTool" \
+              --notes "Актуальная сборка SFTool. Файлы обновляются автоматически."
+          fi
+
+          gh release upload latest publish/SFTool.apk --repo "$PUBLIC_REPO" --clobber
+          gh release upload latest publish/latest.json --repo "$PUBLIC_REPO" --clobber
+          echo "SFTool APK опубликован. Подробные логи и mapping.txt остаются в приватном репозитории."
