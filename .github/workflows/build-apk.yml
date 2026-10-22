@@ -1,0 +1,342 @@
+name: Build APK (private source, public runner)
+
+# ВАЖНО: Actions-логи этого публичного builder-репозитория видны посторонним.
+# Не выводить секреты/содержимое known_keys.txt в лог и не добавлять PR-триггеры.
+# PRIVATE_REPO_TOKEN даёт доступ к приватному lharmonie07/myapp; хранить его
+# только в Settings -> Secrets and variables -> Actions.
+
+# Запуск вручную из вкладки Actions публичного репозитория.
+# Архивы обновлений сначала загружаются в корень приватного lharmonie07/myapp,
+# затем здесь вручную нажимается Run workflow: архив применится, изменения
+# отправятся в main, после чего APK соберётся и релизы обновятся в приватном repo.
+#
+# ВАЖНО: workflow-логи публичны. Не добавляйте в них содержимое исходников,
+# known_keys.txt, keystore или токены. Не добавляйте pull_request-триггеры.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source
+
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: lharmonie07/myapp
+          ref: main
+          path: source
+          fetch-depth: 0
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      # Обрабатывает ЛЮБОЙ .zip в корне репозитория: распаковывает поверх
+      # проекта, удаляет сам архив, коммитит и отправляет изменения в main
+      # (чтобы в истории остался обычный читаемый коммит с диффом) — и затем
+      # ЭТОТ ЖЕ запуск продолжается сразу сборкой ниже, без ожидания нового
+      # push и без повторного запуска вручную. Файлы на диске раннера уже
+      # обновлены распаковкой, git push лишь синхронизирует их с GitHub.
+      - name: Apply ZIP archives
+        id: apply_archives
+        run: |
+          set -e
+
+          shopt -s nullglob
+          archives=( *.zip )
+
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "ZIP-архивы в корне не найдены."
+            echo "archive_applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Найдены ZIP-архивы:"
+          printf ' - %s\n' "${archives[@]}"
+
+          for archive in "${archives[@]}"; do
+            echo ""
+            echo "=========================================="
+            echo "Распаковка: $archive"
+            echo "=========================================="
+
+            unzip -o "$archive" -d .
+
+            echo "Удаление архива: $archive"
+            rm -f "$archive"
+          done
+
+          git config user.name "SFTool CI"
+          git config user.email "ci@sftool.local"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "После распаковки изменений нет."
+            echo "archive_applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ИСПРАВЛЕНО (жалоба "в ОБ ОБНОВЛЕНИИ не читается список изменений"):
+          # заголовок ЭТОГО коммита дословно становится содержимым "ОБ
+          # ОБНОВЛЕНИИ" на телефоне (notes ниже в шаге "Publish release..."
+          # собираются как git log --pretty=%s между релизами) — а здесь
+          # всегда был один и тот же техническийтекст "Apply update archive
+          # [skip ci]", который и видел пользователь вместо описания того,
+          # что реально поменялось.
+          #
+          # Если в корне архива лежит CHANGELOG_PENDING.txt — его первая
+          # строка идёт в заголовок коммита (а значит и в список изменений),
+          # сам файл в репозитории не остаётся. Без него используется
+          # нейтральное "Apply update archive" — но уже БЕЗ "[skip ci]" в
+          # заголовке: метка переехала во вторую строку (тело коммита) —
+          # GitHub распознаёт [skip ci] в сообщении коммита целиком, не
+          # только в первой строке, так что пропуск повторного запуска
+          # работает так же, как раньше, а сам заголовок остаётся читаемым.
+          COMMIT_SUBJECT="Apply update archive"
+          if [ -f CHANGELOG_PENDING.txt ]; then
+            FIRST_LINE=$(head -n1 CHANGELOG_PENDING.txt | tr -d '\r')
+            if [ -n "$FIRST_LINE" ]; then
+              COMMIT_SUBJECT="$FIRST_LINE"
+            fi
+            rm -f CHANGELOG_PENDING.txt
+            git add -A
+          fi
+
+          git commit -m "$COMMIT_SUBJECT" -m "[skip ci]"
+          git push origin main
+
+          echo "Архив применён и закоммичен — сборка продолжается в этом же запуске."
+
+          echo "archive_applied=true" >> "$GITHUB_OUTPUT"
+
+      # JDK 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          # Кеш зависимостей Gradle (~/.gradle/caches + wrapper) средствами
+          # самого setup-java — экономит минуты CI: без этого каждый прогон
+          # заново скачивал бы все Gradle/AGP/Kotlin-зависимости с нуля.
+          cache: gradle
+          cache-dependency-path: |
+            source/**/*.gradle*
+            source/gradle/wrapper/gradle-wrapper.properties
+
+      # NDK/CMake — самое долгое в установке SDK (гигабайты), а в образе
+      # ubuntu-latest предустановлены не все версии. Кешируем по точным
+      # версиям ниже, чтобы повторные прогоны не докачивали их заново.
+      - name: Cache Android NDK/CMake
+        id: ndk-cmake-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/ndk/26.1.10909125
+            /usr/local/lib/android/sdk/cmake/3.22.1
+          key: android-ndk-26.1.10909125-cmake-3.22.1
+
+      # Поиск или установка Android cmdline-tools
+      - name: Locate or install Android cmdline-tools
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "cmdline-tools уже есть в образе"
+          else
+            echo "cmdline-tools не найдены — докачиваю с dl.google.com"
+
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK_ROOT/cmdline-tools"
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" \
+               "$SDK_ROOT/cmdline-tools/latest"
+          fi
+
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Accept SDK licenses, install platform + NDK + CMake
+        run: |
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null || true
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" \
+            "platforms;android-34" \
+            "ndk;26.1.10909125" \
+            "cmake;3.22.1"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build release APK
+        run: |
+          set +e
+
+          # Полный лог сохраняется только на runner и не публикуется в логах Actions.
+          # Это снижает риск раскрытия строк приватного исходного кода в публичном repo.
+          ./gradlew assembleRelease --stacktrace > build.log 2>&1
+          status=$?
+
+          if [ "$status" -eq 0 ]; then
+            echo "Release APK успешно собран."
+            exit 0
+          fi
+
+          # Не выводим диагностические строки в публичный Actions log:
+          # полный build.log будет загружен в приватный репозиторий отдельным шагом.
+          echo "::error::Сборка APK завершилась ошибкой (код $status). Полный лог будет сохранён в приватном репозитории."
+          exit "$status"
+
+      - name: Save full build log in private repository
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        working-directory: source
+        run: |
+          set -e
+
+          if [ ! -s build.log ]; then
+            echo "Файл build.log отсутствует или пуст; сохранять нечего."
+            exit 0
+          fi
+
+          LOG_TAG="build-log-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          LOG_FILE="build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}.log"
+
+          # Публикуем лог только как вложение приватного prerelease в myapp.
+          cp build.log "$LOG_FILE"
+          gh release create "$LOG_TAG" "$LOG_FILE" \
+            --repo lharmonie07/myapp \
+            --title "Build log ${GITHUB_RUN_NUMBER} (run ${GITHUB_RUN_ID})" \
+            --prerelease \
+            --notes "Полный лог сборки APK. Workflow run: ${GITHUB_RUN_ID}; attempt: ${GITHUB_RUN_ATTEMPT}."
+
+      # Не публикуем APK и mapping.txt как артефакты публичного репозитория:
+      # APK передаётся через релизы приватного myapp, а mapping.txt не должен
+      # оказаться доступен всем посетителям публичного builder-репозитория.
+
+      - name: Create internal release (для передачи APK агенту)
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -e
+          VERSION_CODE=$(git rev-list --count HEAD)
+          TAG="internal-$VERSION_CODE"
+          VERSION_NAME=$(sed -n 's/^val sftoolVersionName = "\(.*\)"$/\1/p' app/build.gradle.kts)
+          APK_PATH=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          RENAMED="sftool-v${VERSION_NAME}.apk"
+
+          cp "$APK_PATH" "$RENAMED"
+
+          # mapping.txt хранится вложением служебного prerelease приватного myapp.
+          # Он не публикуется как артефакт публичного builder-репозитория.
+          MAPPING_PATH="app/build/outputs/mapping/release/mapping.txt"
+          MAPPING_RENAMED="mapping-v${VERSION_NAME}.txt"
+          cp "$MAPPING_PATH" "$MAPPING_RENAMED"
+
+          if gh release view "$TAG" --repo lharmonie07/myapp >/dev/null 2>&1; then
+            gh release upload "$TAG" "$RENAMED" "$MAPPING_RENAMED" \
+              --repo lharmonie07/myapp \
+              --clobber
+          else
+            # --prerelease — ВАЖНО: ниже, в шаге "Publish release...", этот
+            # же репозиторий получает ещё и ПУБЛИЧНЫЙ для приложения релиз
+            # (тег "v1.$VERSION_CODE", см. UpdateChecker.kt), который
+            # приложение находит через /releases/latest. Этот эндпоинт
+            # автоматически пропускает prerelease-записи — так что этот
+            # служебный релиз (только для передачи APK агенту) никогда не
+            # окажется там по ошибке вместо настоящего.
+            gh release create "$TAG" "$RENAMED" "$MAPPING_RENAMED" \
+              --repo lharmonie07/myapp \
+              --title "internal $VERSION_CODE" \
+              --prerelease \
+              --notes "Служебный релиз — только для передачи APK агенту. Не для конечных пользователей (см. тег v1.$VERSION_CODE)."
+          fi
+
+      # ФИНАЛЬНАЯ схема (по прямой просьбе пользователя — "полностью
+      # интегрировать под приватный репозиторий"): публикация идёт ТОЛЬКО в
+      # myapp, отдельный публичный репозиторий-витрина и RELEASES_REPO_TOKEN
+      # большe не используются (секрет можно отозвать на стороне GitHub —
+      # он здесь ничем не используется). OLD_SHA для списка изменений
+      # теперь берётся не из внешнего latest.json, а из target_commitish
+      # ПРЕДЫДУЩЕГО релиза myapp через API — тот SHA, на котором была
+      # создана его метка (прописывается явно через --target при создании,
+      # см. ниже), так что отдельный файл-манифест для этого не нужен.
+      - name: Publish release to lharmonie07/myapp
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -e
+
+          VERSION_CODE=$(git rev-list --count HEAD)
+
+          # НАЙДЕНО ПРИ АУДИТЕ (объясняет задвоенные строки в списке изменений):
+          # ${{ github.sha }} — это SHA коммита, который ЗАПУСТИЛ workflow,
+          # то есть ДО собственного коммита шага "Apply ZIP archives" (тот
+          # коммитит и пушит применённый архив уже ПОСЛЕ старта этого
+          # запуска) — контекст github.sha при этом не обновляется. Настоящий
+          # HEAD — вот этот, после пуша, именно он и попадает в target_commitish
+          # релиза ниже, чтобы СЛЕДУЮЩИЙ запуск мог его забрать обратно.
+          CURRENT_SHA=$(git rev-parse HEAD)
+
+          # Видимая версия — только versionName из build.gradle.kts ("2.0").
+          # Тег "v1.$VERSION_CODE" остаётся служебным: UpdateChecker.kt берёт из
+          # него versionCode для сравнения, пользователю он не показывается.
+          VERSION_NAME=$(sed -n 's/^val sftoolVersionName = "\(.*\)"$/\1/p' app/build.gradle.kts)
+          APK_PATH=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          RENAMED="sftool-v${VERSION_NAME}.apk"
+          cp "$APK_PATH" "$RENAMED"
+
+          # Пока ЭТОТ запуск ещё не опубликовал новый релиз, "latest" — это
+          # ещё ПРЕДЫДУЩИЙ, с которым и сравниваем. Если релизов ещё нет
+          # вообще (самый первый запуск по этой схеме) — просто пустая
+          # строка, ниже это обрабатывается как "сравнивать не с чем".
+          OLD_SHA=$(gh api repos/lharmonie07/myapp/releases/latest --jq '.target_commitish' 2>/dev/null || true)
+
+          if [ -n "$OLD_SHA" ] && git cat-file -e "${OLD_SHA}^{commit}" 2>/dev/null; then
+            COMMIT_SUBJECTS=$(git log --pretty=%s "${OLD_SHA}..HEAD")
+          else
+            COMMIT_SUBJECTS=$(git log -1 --pretty=%s)
+          fi
+
+          # Фильтр технических/случайных строк — см. комментарий у "Apply ZIP
+          # archives": диапазон OLD_SHA..HEAD может захватывать и более
+          # старые коммиты, так что без фильтра на уровне ВЫВОДА технический
+          # мусор мог просочиться и из них.
+          #
+          # "Compile job ..." / "Cleanup: native_libs/jobs/..." — добавлено
+          # по жалобе на скриншоте: это коммиты Компилятора библиотек
+          # (github/GitHubCompileClient.kt пушит source.cpp/job.json в
+          # native_libs/jobs/<id>/ перед сборкой и удаляет их после) — тоже
+          # реальные коммиты в myapp, тоже техника, не для списка изменений.
+          NOTES=$(echo "$COMMIT_SUBJECTS" \
+            | sed '/^\s*$/d' \
+            | grep -viE '^(Apply update archive|Add files? via upload|Delete CHANGELOG|Initial commit|Merge |Compile job |Cleanup: native_libs/jobs/)|\[skip ci\]' \
+            | sed 's/^/* /')
+
+          # Если после фильтра не осталось пользовательских изменений,
+          # НЕ добавляем техническую строку вида "Автоматическая сборка из ...".
+          # Она не должна попадать в "ОБ ОБНОВЛЕНИИ" на телефоне.
+          if [ -z "$NOTES" ]; then
+            NOTES=""
+          fi
+
+          NEW_TAG="v1.$VERSION_CODE"
+          if gh release view "$NEW_TAG" --repo lharmonie07/myapp >/dev/null 2>&1; then
+            gh release upload "$NEW_TAG" "$RENAMED" --repo lharmonie07/myapp --clobber
+            gh release edit "$NEW_TAG" --repo lharmonie07/myapp --notes "$NOTES" --title "SFTool v${VERSION_NAME}"
+          else
+            gh release create "$NEW_TAG" "$RENAMED" \
+              --repo lharmonie07/myapp \
+              --target "$CURRENT_SHA" \
+              --title "SFTool v${VERSION_NAME}" \
+              --notes "$NOTES"
+          fi
