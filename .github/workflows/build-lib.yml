@@ -1,0 +1,240 @@
+name: Build Library (private source, public runner)
+
+# ВАЖНО: Actions-логи этого публичного репозитория видны посторонним.
+# Здесь НЕЛЬЗЯ печатать содержимое исходников, пути файлов, вывод
+# компилятора и CMake — всё это идёт только в файлы и затем в ПРИВАТНЫЙ
+# репозиторий. Не добавлять pull_request-триггеры, не включать set -x.
+#
+# Запускается приложением (workflow_dispatch с job_id). Исходники и job.json
+# лежат в приватном lharmonie07/myapp в native_libs/jobs/<job_id>/ — их
+# туда заранее коммитит приложение. Результат (output.so или error.txt)
+# публикуется вложением приватного prerelease lib-<job_id> в myapp;
+# приложение скачивает его и удаляет релиз вместе с тегом.
+run-name: "Build lib: ${{ inputs.job_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Идентификатор задания (папка native_libs/jobs/<job_id>/ в приватном репо)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      # Та же версия NDK, что в проверенном процессе на Google Colab
+      # (Android_NDK_build_hook_ARM64_fixed.ipynb); отличается от NDK
+      # основной сборки APK (26.1.10909125) сознательно.
+      NDK_VERSION: "27.2.12479018"
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: lharmonie07/myapp
+          ref: main
+          path: source
+          fetch-depth: 1
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install cmake/ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build
+
+      - name: Locate or install Android cmdline-tools
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          if [ ! -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK_ROOT/cmdline-tools"
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+          fi
+
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+      # Кэш содержит только публичный NDK от Google, никаких данных из myapp.
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+          key: ndk-${{ env.NDK_VERSION }}-ubuntu-latest
+
+      - name: Install NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null || true
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "ndk;$NDK_VERSION" > /dev/null
+
+      - name: Generate CMakeLists.txt
+        id: cmakelists
+        working-directory: source
+        run: |
+          set +e
+          mkdir -p out
+          JOB_DIR="native_libs/jobs/$JOB_ID"
+
+          if [ ! -f "$JOB_DIR/job.json" ]; then
+            echo "job.json не найден: $JOB_DIR/job.json" > out/error.txt
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LIBRARY_NAME=$(jq -r '.libraryName // "smods"' "$JOB_DIR/job.json")
+          SOURCES=$(jq -r '.sourceFiles[]' "$JOB_DIR/job.json" | tr '\n' ' ')
+          EXTRA_FLAGS=$(jq -r '.extraCompileFlags // ""' "$JOB_DIR/job.json")
+          EXTRA_LIBS=$(jq -r '.extraLinkLibs // "log"' "$JOB_DIR/job.json")
+          TARGET=$(jq -r '.clangTarget' "$JOB_DIR/job.json")
+          API=$(echo "$TARGET" | grep -oE '[0-9]+$')
+          if [ -z "$API" ]; then API=21; fi
+
+          if [ -z "$(echo "$SOURCES" | tr -d '[:space:]')" ]; then
+            echo "job.json: sourceFiles пуст — нечего собирать" > out/error.txt
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "cmake_minimum_required(VERSION 3.22)"
+            echo "project($LIBRARY_NAME LANGUAGES CXX)"
+            echo ""
+            echo "add_library($LIBRARY_NAME SHARED $SOURCES)"
+            echo ""
+            echo "target_compile_features($LIBRARY_NAME PRIVATE cxx_std_17)"
+            echo "target_compile_options($LIBRARY_NAME PRIVATE"
+            echo "    -O2"
+            echo "    -fvisibility=hidden"
+            echo "    -ffunction-sections"
+            echo "    -fdata-sections"
+            if [ -n "$EXTRA_FLAGS" ]; then echo "    $EXTRA_FLAGS"; fi
+            echo ")"
+            echo ""
+            echo "target_link_options($LIBRARY_NAME PRIVATE -Wl,--gc-sections)"
+            echo "target_link_libraries($LIBRARY_NAME $EXTRA_LIBS)"
+          } > "$JOB_DIR/CMakeLists.txt"
+
+          echo "library_name=$LIBRARY_NAME" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "api=$API" >> "$GITHUB_OUTPUT"
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Configure (CMake + Ninja, NDK toolchain)
+        id: configure
+        if: steps.cmakelists.outputs.status == 'ok'
+        working-directory: source
+        run: |
+          set +e
+          JOB_DIR="native_libs/jobs/$JOB_ID"
+          NDK_DIR="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          TARGET="${{ steps.cmakelists.outputs.target }}"
+          API="${{ steps.cmakelists.outputs.api }}"
+
+          # Вывод CMake — ТОЛЬКО в файл, в публичный лог не попадает.
+          cmake -G Ninja \
+            -S "$JOB_DIR" \
+            -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_DIR/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-$API" \
+            -DANDROID_NDK="$NDK_DIR" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="--target=$TARGET" \
+            -DCMAKE_SHARED_LINKER_FLAGS="--target=$TARGET" \
+            > out/cmake_configure.log 2>&1
+          status=$?
+
+          if [ "$status" -ne 0 ]; then
+            tail -n 200 out/cmake_configure.log > out/error.txt
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Build (cmake --build --parallel)
+        id: build
+        if: steps.cmakelists.outputs.status == 'ok' && steps.configure.outputs.status == 'ok'
+        working-directory: source
+        run: |
+          set +e
+          # Вывод компилятора (в нём бывают строки исходника) — только в файл.
+          cmake --build build --parallel > out/cmake_build.log 2>&1
+          status=$?
+
+          LIBRARY_NAME="${{ steps.cmakelists.outputs.library_name }}"
+          SO_PATH="build/lib${LIBRARY_NAME}.so"
+
+          if [ "$status" -ne 0 ] || [ ! -f "$SO_PATH" ]; then
+            tail -n 200 out/cmake_build.log > out/error.txt
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cp "$SO_PATH" out/output.so
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Verify ELF (AArch64)
+        id: verify
+        if: steps.cmakelists.outputs.status == 'ok' && steps.configure.outputs.status == 'ok' && steps.build.outputs.status == 'ok'
+        working-directory: source
+        run: |
+          set +e
+          READELF="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          ARCH_INFO=$("$READELF" -h "out/output.so" 2>&1 | grep -E 'Class|Machine')
+          if ! echo "$ARCH_INFO" | grep -q 'AArch64'; then
+            echo "Собранный .so НЕ AArch64 — проверьте target/API в job.json" > out/error.txt
+            echo "$ARCH_INFO" >> out/error.txt
+            rm -f out/output.so
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      # Результат уходит ТОЛЬКО в приватный myapp (вложение prerelease), а не
+      # в артефакты этого публичного репозитория. prerelease автоматически
+      # пропускается эндпоинтом /releases/latest, так что на проверку
+      # обновлений приложения не влияет.
+      - name: Publish result to private repository
+        if: always()
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set +e
+          mkdir -p out
+          rm -f out/cmake_configure.log out/cmake_build.log
+
+          if [ -z "$(ls -A out)" ]; then
+            echo "Сборка не создала результата (ранний сбой раннера)." > out/error.txt
+          fi
+
+          TAG="lib-$JOB_ID"
+          gh release create "$TAG" out/* \
+            --repo lharmonie07/myapp \
+            --target main \
+            --prerelease \
+            --title "Library build $JOB_ID" \
+            --notes "Служебный релиз с результатом компиляции библиотеки. Приложение удаляет его после скачивания." \
+            > /dev/null 2>&1
+
+      - name: Fail the run if compile failed
+        # Отдельным шагом, чтобы публикация выше успела отработать.
+        if: steps.cmakelists.outputs.status != 'ok' || steps.configure.outputs.status != 'ok' || steps.build.outputs.status != 'ok' || steps.verify.outputs.status != 'ok'
+        run: exit 1
