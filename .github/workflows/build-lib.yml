@@ -106,6 +106,17 @@ jobs:
           API=$(echo "$TARGET" | grep -oE '[0-9]+$')
           if [ -z "$API" ]; then API=21; fi
 
+          # ABI — "arm64-v8a" (64-бит, по умолчанию при отсутствии поля — так
+          # собирались все задания до появления выбора разрядности на
+          # стороне приложения) или "armeabi-v7a" (32-бит). Любое другое
+          # значение — явная ошибка задания, не тихий фоллбек.
+          ABI=$(jq -r '.abi // "arm64-v8a"' "$JOB_DIR/job.json")
+          if [ "$ABI" != "arm64-v8a" ] && [ "$ABI" != "armeabi-v7a" ]; then
+            echo "job.json: неизвестный abi '$ABI' (ожидается arm64-v8a или armeabi-v7a)" > out/error.txt
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ -z "$(echo "$SOURCES" | tr -d '[:space:]')" ]; then
             echo "job.json: sourceFiles пуст — нечего собирать" > out/error.txt
             echo "status=error" >> "$GITHUB_OUTPUT"
@@ -134,6 +145,7 @@ jobs:
           echo "library_name=$LIBRARY_NAME" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "api=$API" >> "$GITHUB_OUTPUT"
+          echo "abi=$ABI" >> "$GITHUB_OUTPUT"
           echo "status=ok" >> "$GITHUB_OUTPUT"
 
       - name: Configure (CMake + Ninja, NDK toolchain)
@@ -146,13 +158,14 @@ jobs:
           NDK_DIR="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
           TARGET="${{ steps.cmakelists.outputs.target }}"
           API="${{ steps.cmakelists.outputs.api }}"
+          ABI="${{ steps.cmakelists.outputs.abi }}"
 
           # Вывод CMake — ТОЛЬКО в файл, в публичный лог не попадает.
           cmake -G Ninja \
             -S "$JOB_DIR" \
             -B build \
             -DCMAKE_TOOLCHAIN_FILE="$NDK_DIR/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_ABI="$ABI" \
             -DANDROID_PLATFORM="android-$API" \
             -DANDROID_NDK="$NDK_DIR" \
             -DCMAKE_BUILD_TYPE=Release \
@@ -190,16 +203,22 @@ jobs:
           cp "$SO_PATH" out/output.so
           echo "status=ok" >> "$GITHUB_OUTPUT"
 
-      - name: Verify ELF (AArch64)
+      - name: Verify ELF (architecture matches requested ABI)
         id: verify
         if: steps.cmakelists.outputs.status == 'ok' && steps.configure.outputs.status == 'ok' && steps.build.outputs.status == 'ok'
         working-directory: source
         run: |
           set +e
+          ABI="${{ steps.cmakelists.outputs.abi }}"
+          # arm64-v8a -> AArch64/ELF64, armeabi-v7a -> ARM/ELF32 — так
+          # llvm-readelf -h подписывает поля Machine/Class для каждой из
+          # этих двух разрядностей NDK.
+          if [ "$ABI" = "armeabi-v7a" ]; then EXPECT_MACHINE="ARM"; EXPECT_CLASS="ELF32"; else EXPECT_MACHINE="AArch64"; EXPECT_CLASS="ELF64"; fi
+
           READELF="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           ARCH_INFO=$("$READELF" -h "out/output.so" 2>&1 | grep -E 'Class|Machine')
-          if ! echo "$ARCH_INFO" | grep -q 'AArch64'; then
-            echo "Собранный .so НЕ AArch64 — проверьте target/API в job.json" > out/error.txt
+          if ! echo "$ARCH_INFO" | grep -q "$EXPECT_MACHINE" || ! echo "$ARCH_INFO" | grep -q "$EXPECT_CLASS"; then
+            echo "Собранный .so не соответствует запрошенному ABI ($ABI: ожидался $EXPECT_MACHINE/$EXPECT_CLASS)" > out/error.txt
             echo "$ARCH_INFO" >> out/error.txt
             rm -f out/output.so
             echo "status=error" >> "$GITHUB_OUTPUT"
