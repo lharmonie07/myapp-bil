@@ -197,6 +197,8 @@ jobs:
 
       - name: Save full build log in private repository
         if: always()
+        # Сохранение лога вторично: сбой GitHub API (502) не должен блокировать публикацию APK ниже.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         working-directory: source
@@ -213,11 +215,20 @@ jobs:
 
           # Публикуем лог только как вложение приватного prerelease в myapp.
           cp build.log "$LOG_FILE"
-          gh release create "$LOG_TAG" "$LOG_FILE" \
-            --repo lharmonie07/myapp \
-            --title "Build log ${GITHUB_RUN_NUMBER} (run ${GITHUB_RUN_ID})" \
-            --prerelease \
-            --notes "Полный лог сборки APK. Workflow run: ${GITHUB_RUN_ID}; attempt: ${GITHUB_RUN_ATTEMPT}."
+          for attempt in 1 2 3; do
+            if gh release create "$LOG_TAG" "$LOG_FILE" \
+              --repo lharmonie07/myapp \
+              --title "Build log ${GITHUB_RUN_NUMBER} (run ${GITHUB_RUN_ID})" \
+              --prerelease \
+              --notes "Полный лог сборки APK. Workflow run: ${GITHUB_RUN_ID}; attempt: ${GITHUB_RUN_ATTEMPT}."; then
+              exit 0
+            fi
+            echo "Попытка ${attempt} сохранить лог не удалась."
+            gh release delete "$LOG_TAG" --repo lharmonie07/myapp --yes --cleanup-tag >/dev/null 2>&1 || true
+            sleep 20
+          done
+          echo "Не удалось сохранить лог после 3 попыток; продолжаем без него."
+          exit 1
 
       # Не публикуем APK и mapping.txt как артефакты публичного репозитория:
       # APK передаётся через релизы приватного myapp, а mapping.txt не должен
